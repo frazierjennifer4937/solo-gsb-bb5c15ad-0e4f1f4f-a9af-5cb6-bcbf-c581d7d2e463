@@ -10,10 +10,19 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 
+from . import consistency
 from .anonymizer import JobResult
 from .config import settings
 from .jobs import registry
-from .schemas import FileOut, JobOut, PatientOut, SeriesOut, StudyOut
+from .schemas import (
+    ConsistencyCheckIn,
+    ConsistencyCheckOut,
+    FileOut,
+    JobOut,
+    PatientOut,
+    SeriesOut,
+    StudyOut,
+)
 
 
 @asynccontextmanager
@@ -169,6 +178,59 @@ async def create_job(
     return _serialize_job(job)
 
 
+@app.post(
+    "/jobs/consistency-check",
+    response_model=ConsistencyCheckOut,
+    tags=["jobs"],
+    summary="核对多个任务的密钥指纹、患者伪名与 UID 映射一致性",
+    responses={
+        404: {"description": "存在任务不存在或已过期"},
+        409: {"description": "任务未完成，或各任务的密钥指纹不一致"},
+    },
+)
+def consistency_check(body: ConsistencyCheckIn) -> ConsistencyCheckOut:
+    jobs = []
+    for job_id in body.job_ids:
+        job = registry.get(job_id)
+        if job is None:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "error": "JOB_NOT_FOUND",
+                    "message": "任务不存在或已过期",
+                    "job_id": job_id,
+                },
+            )
+        if job.status != "ready":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "JOB_NOT_READY",
+                    "message": "任务尚未成功完成，无法参与一致性核对",
+                    "job_id": job_id,
+                    "status": job.status,
+                    "job_error": job.error,
+                },
+            )
+        jobs.append(job)
+
+    fingerprints = {job.secret_fingerprint for job in jobs}
+    if len(fingerprints) > 1:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "SECRET_FINGERPRINT_MISMATCH",
+                "message": "任务使用了不同的稳定密钥，伪名/UID 映射不可比",
+                "fingerprints": [
+                    {"job_id": job.id, "secret_fingerprint": job.secret_fingerprint}
+                    for job in jobs
+                ],
+            },
+        )
+
+    return consistency.build_report(jobs)
+
+
 @app.get(
     "/jobs/{job_id}",
     response_model=JobOut,
@@ -231,6 +293,7 @@ def root() -> dict:
         "openapi": "/openapi.json",
         "endpoints": [
             "POST /jobs",
+            "POST /jobs/consistency-check",
             "GET /jobs/{job_id}",
             "GET /jobs/{job_id}/files",
             "GET /jobs/{job_id}/download",
