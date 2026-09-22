@@ -11,9 +11,19 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 
 from .anonymizer import JobResult
+from . import consistency
 from .config import settings
 from .jobs import registry
-from .schemas import FileOut, JobOut, PatientOut, SeriesOut, StudyOut
+from .schemas import (
+    ConsistencyCheckOut,
+    ConsistencyCheckRequest,
+    ConsistencyErrorDetail,
+    FileOut,
+    JobOut,
+    PatientOut,
+    SeriesOut,
+    StudyOut,
+)
 
 
 @asynccontextmanager
@@ -30,7 +40,8 @@ app = FastAPI(
     description=(
         "上传影像 ZIP，使用用户提供的稳定密钥生成患者级伪名，重写 "
         "Patient/Study/Series/SOP/FrameOfReference UID 与身份字段，"
-        "递归更新序列内引用并保持检查关系。提供标签变更预览与匿名化 ZIP 下载。"
+        "递归更新序列内引用并保持检查关系。提供标签变更预览与匿名化 ZIP 下载，"
+        "并支持对多个已完成任务做跨批次密钥指纹/伪名/UID 映射一致性核对。"
     ),
     lifespan=lifespan,
 )
@@ -169,6 +180,65 @@ async def create_job(
     return _serialize_job(job)
 
 
+@app.post(
+    "/jobs/consistency-check",
+    response_model=ConsistencyCheckOut,
+    tags=["jobs"],
+    summary="核对多个已完成任务的密钥指纹、患者稳定伪名与 Study/Series/SOP UID 映射",
+    responses={
+        404: {"model": ConsistencyErrorDetail, "description": "部分任务不存在或已过期"},
+        409: {"model": ConsistencyErrorDetail,
+              "description": "部分任务未完成，或任务间密钥指纹不一致"},
+    },
+)
+def consistency_check(body: ConsistencyCheckRequest) -> ConsistencyCheckOut:
+    jobs = []
+    missing = []
+    for job_id in body.job_ids:
+        job = registry.get(job_id)
+        if job is None:
+            missing.append(job_id)
+        else:
+            jobs.append(job)
+    if missing:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "JOB_NOT_FOUND",
+                "message": "部分任务不存在或已过期",
+                "missing_job_ids": missing,
+            },
+        )
+
+    not_ready = [
+        {"id": job.id, "status": job.status, "error": job.error or ""}
+        for job in jobs
+        if job.status != "ready"
+    ]
+    if not_ready:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "JOBS_NOT_COMPLETED",
+                "message": "仅支持已完成（status=ready）的任务",
+                "not_ready_jobs": not_ready,
+            },
+        )
+
+    fingerprints = {job.id: job.secret_fingerprint for job in jobs}
+    if len(set(fingerprints.values())) > 1:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "SECRET_FINGERPRINT_MISMATCH",
+                "message": "任务使用了不同的稳定密钥（指纹不一致），无法进行一致性核对",
+                "fingerprints": fingerprints,
+            },
+        )
+
+    return ConsistencyCheckOut.model_validate(consistency.build_report(jobs))
+
+
 @app.get(
     "/jobs/{job_id}",
     response_model=JobOut,
@@ -231,6 +301,7 @@ def root() -> dict:
         "openapi": "/openapi.json",
         "endpoints": [
             "POST /jobs",
+            "POST /jobs/consistency-check",
             "GET /jobs/{job_id}",
             "GET /jobs/{job_id}/files",
             "GET /jobs/{job_id}/download",

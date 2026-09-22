@@ -68,6 +68,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `POST` | `/jobs` | 上传 ZIP（multipart），同步处理并返回完整标签变更预览与诊断 |
+| `POST` | `/jobs/consistency-check` | 核对 2～5 个已完成任务的密钥指纹、患者伪名与 Study/Series/SOP UID 映射 |
 | `GET` | `/jobs/{job_id}` | 获取任务结果（预览 + 诊断 + UID 映射概览） |
 | `GET` | `/jobs/{job_id}/files` | 仅获取逐文件诊断与变更列表 |
 | `GET` | `/jobs/{job_id}/download` | 下载匿名化后的 ZIP |
@@ -122,6 +123,126 @@ open("anonymized.zip", "wb").write(
     requests.get(f"http://localhost:8000/jobs/{job['id']}/download").content
 )
 ```
+
+---
+
+## 跨任务一致性核对（`POST /jobs/consistency-check`）
+
+分多个批次上传、但使用**同一把稳定密钥**时，确定性派生应保证：同一患者跨批次得到
+相同伪名、同一原始 UID 跨批次映射到同一新 UID。本接口接收 **2～5 个已完成任务**
+（`status=ready`），核对：
+
+1. **secret 指纹**：所有任务必须来自同一密钥（SHA-256 前 12 位），否则直接 `409`；
+2. **患者稳定伪名**：同一患者 key 的 `new_patient_id` / `new_patient_name` 是否一致、
+   日期偏移是否一致（`shift_dates` 开关不同会产生 `date_shift_mismatch`）；
+3. **Study / Series / SOP 三级 UID 映射**：同一原始 UID 是否映射到同一新 UID，
+   以及不同原始 UID 是否碰撞到同一新 UID。
+
+请求体（JSON）：
+
+```json
+{"job_ids": ["0d03…", "7f2a…"]}
+```
+
+- 数组长度必须为 **2～5**，元素不可重复、不可为空白字符串，否则 `422`。
+
+curl 示例：
+
+```bash
+curl -X POST http://localhost:8000/jobs/consistency-check \
+  -H "Content-Type: application/json" \
+  -d '{"job_ids": ["0d03abcd1234", "7f2a9876ef01"]}'
+```
+
+Python 示例：
+
+```python
+resp = requests.post(
+    "http://localhost:8000/jobs/consistency-check",
+    json={"job_ids": [job1_id, job2_id, job3_id]},
+)
+if resp.status_code == 404:
+    print("任务不存在：", resp.json()["detail"]["missing_job_ids"])
+elif resp.status_code == 409:
+    print("无法核对：", resp.json()["detail"]["code"])  # 未完成或指纹不一致
+else:
+    report = resp.json()
+    print(report["overall_status"])      # consistent | inconsistent
+    print(report["summary"])             # 各类冲突/覆盖差异计数
+```
+
+响应示例：
+
+```jsonc
+{
+  "overall_status": "consistent",       // consistent | inconsistent
+  "secret_fingerprint": "3efffbab4a80",
+  "jobs": [
+    {"id": "0d03…", "status": "ready", "secret_fingerprint": "3efffbab4a80",
+     "shift_dates": true, "source_zip": "batch-a.zip",
+     "file_count": 6, "output_file_count": 4, "error_count": 2,
+     "warning_count": 1, "patient_count": 2, "study_count": 2,
+     "series_count": 3, "sop_count": 4,
+     "created_at": 1790120660.8, "expires_at": 1790124260.8}
+  ],
+  "patient_mappings": {
+    "checked_keys": 2,                  // >=2 个任务共同出现、实际比对过的患者数
+    "conflict_count": 0,                // 同 key 派生出不同伪名
+    "date_shift_mismatch_count": 0,     // 伪名一致但日期偏移不同
+    "only_in_one_job_count": 0,         // 患者仅出现在部分任务（覆盖范围差异）
+    "shift_dates_consistent": true,
+    "differences": [
+      {"patient_key": "id:P-002",
+       "difference_type": "only_in_one_job",   // conflict | date_shift_mismatch | only_in_one_job
+       "values": {"0d03…": {"new_patient_id": "MII3…",
+                            "new_patient_name": "ANON^MII3RH4JPC",
+                            "date_shift_days": -46}},
+       "present_in": ["0d03…"], "missing_in": ["7f2a…"]}
+    ]
+  },
+  "uid_mappings": [
+    {"level": "study",                  // study | series | sop
+     "checked_old_uids": 2,
+     "conflict_count": 0,               // 同一原始 UID -> 不同新 UID
+     "only_in_one_job_count": 0,        // UID 仅出现在部分任务（覆盖范围差异）
+     "new_uid_collision_count": 0,      // 不同原始 UID 碰撞到同一新 UID
+     "differences_truncated": false,    // 明细过多时截断（计数始终完整）
+     "differences": [
+       {"level": "sop", "old_uid": "1.2.840.…",
+        "difference_type": "conflict",  // conflict | only_in_one_job | uid_new_collision
+        "mappings": {"0d03…": "2.25.111…", "7f2a…": "2.25.222…"},
+        "present_in": ["0d03…", "7f2a…"], "missing_in": []}
+     ]}
+  ],
+  "summary": {
+    "patient_conflict": 0,
+    "patient_date_shift_mismatch": 0,
+    "uid_conflict": 0,
+    "uid_new_collision": 0,
+    "patient_only_in_one_job": 0,
+    "uid_only_in_one_job": 0
+  }
+}
+```
+
+判定口径：
+
+- `overall_status = "inconsistent"` 当且仅当存在患者伪名冲突、日期偏移不一致、
+  UID 映射冲突或 UID 碰撞；仅出现在部分任务中的患者/UID 属于**批次覆盖范围差异**
+  （`only_in_one_job`），不计为冲突；
+- 同一密钥下确定性派生理论上不会产生 `conflict` / `uid_new_collision`，出现这类结果
+  意味着派生算法版本不一致或数据被篡改，应停止合并这些批次；
+- 差异明细每层最多返回 500 条（冲突/碰撞始终完整保留），超出时
+  `differences_truncated=true`，但各类 `*_count` 计数仍然完整。
+
+错误响应（HTTP 4xx，`detail.code` 机器可读）：
+
+| 状态码 | `detail.code` | 触发条件 |
+| --- | --- | --- |
+| `404` | `JOB_NOT_FOUND` | 任一任务 ID 不存在或已过期（`missing_job_ids` 给出缺失列表） |
+| `409` | `JOBS_NOT_COMPLETED` | 存在 `status != ready` 的任务（失败/未完成，见 `not_ready_jobs`） |
+| `409` | `SECRET_FINGERPRINT_MISMATCH` | 任务间密钥指纹不一致（`fingerprints` 给出各任务指纹） |
+| `422` | —（Pydantic 校验） | ID 数量不在 2～5、重复、空白，或请求体格式错误 |
 
 ---
 
@@ -257,14 +378,15 @@ open("anonymized.zip", "wb").write(
 ```
 .
 ├── app/
-│   ├── main.py          # FastAPI 路由（/jobs、/download、/health）
+│   ├── main.py          # FastAPI 路由（/jobs、/jobs/consistency-check、/download、/health）
 │   ├── anonymizer.py    # 两遍扫描引擎：UID 映射、标签重写、递归序列、诊断、ZIP 打包
+│   ├── consistency.py   # 跨任务一致性核对：密钥指纹/患者伪名/UID 映射比对
 │   ├── crypto.py        # HMAC 确定性派生：伪名、UID、日期偏移
 │   ├── tags.py          # Annex E 标签策略与参与一致性重写的 UID 标签集合
 │   ├── jobs.py          # 任务存储、线程池处理、TTL 清理
-│   ├── schemas.py       # 响应模型
+│   ├── schemas.py       # 请求/响应模型（含一致性核对模型）
 │   └── config.py        # 环境变量配置
-├── tests/               # pytest：加密派生 / 引擎 / API 端到端（30 个用例）
+├── tests/               # pytest：加密派生 / 引擎 / API 端到端 / 一致性核对（49 个用例）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
